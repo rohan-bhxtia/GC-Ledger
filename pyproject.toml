@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
+    "google-genai>=2.0",
     "tzdata; sys_platform == 'win32'",
 ]
 
@@ -26,3 +27,5 @@ packages = ["src/gcl"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = ["live: calls the real Gemini API (run with: pytest -m live)"]
+addopts = "-m 'not live'"
