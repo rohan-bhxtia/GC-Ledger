@@ -1,10 +1,10 @@
 """Pydantic schemas shared across the pipeline.
 
-Phase 2: parsed chat messages. Extraction schemas (expenses, commitments,
-events) are added in Phase 3.
+Phase 2: parsed chat messages.
+Phase 3: extraction schemas (raw LLM output + validated records).
 """
 
-from datetime import datetime
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Literal
 
@@ -67,3 +67,145 @@ class ParseResult(BaseModel):
     @property
     def participants(self) -> list[str]:
         return sorted({m.sender for m in self.messages if m.sender})
+
+
+# =============================================================================
+# Extraction (Phase 3)
+#
+# Raw*  = what the LLM returns. UNTRUSTED: names, ids and amounts may be wrong.
+# Plain = validated records, built only by gcl.validation. Amounts in paise.
+# =============================================================================
+
+class SplitType(str, Enum):
+    EQUAL = "equal"
+    EXACT = "exact"              # individual shares written in the chat
+    UNSPECIFIED = "unspecified"
+
+
+class ExpenseStatus(str, Enum):
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    DISPUTED = "disputed"
+    CANCELLED = "cancelled"
+
+
+class SettlementStatus(str, Enum):
+    CLAIMED = "claimed"          # "sending now" / "paid you back"
+    CONFIRMED = "confirmed"      # the receiver acknowledged it
+
+
+class CommitmentStatus(str, Enum):
+    SUGGESTED = "suggested"
+    PROMISED = "promised"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+
+
+class EventStatus(str, Enum):
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+
+
+# --- What the LLM returns ------------------------------------------------------
+
+class RawShare(BaseModel):
+    person: str
+    amount_text: str
+
+
+class RawExpense(BaseModel):
+    payer: str
+    amount_text: str | None = None          # copied verbatim from the chat, never computed
+    description: str = ""
+    participants: list[str] | None = None   # None = not stated
+    split: SplitType = SplitType.UNSPECIFIED
+    shares: list[RawShare] = []
+    status: ExpenseStatus
+    source_msg_ids: list[str] = []
+
+
+class RawSettlement(BaseModel):
+    from_person: str
+    to_person: str
+    amount_text: str
+    status: SettlementStatus
+    source_msg_ids: list[str] = []
+
+
+class RawCommitment(BaseModel):
+    owner: str
+    action: str
+    status: CommitmentStatus
+    due_date: str | None = None    # YYYY-MM-DD
+    due_time: str | None = None    # HH:MM
+    when_text: str | None = None   # original wording, e.g. "kal tak"
+    source_msg_ids: list[str] = []
+
+
+class RawEvent(BaseModel):
+    title: str
+    status: EventStatus
+    on_date: str | None = None     # YYYY-MM-DD
+    at_time: str | None = None     # HH:MM
+    when_text: str | None = None
+    source_msg_ids: list[str] = []
+
+
+class RawExtraction(BaseModel):
+    expenses: list[RawExpense] = []
+    settlements: list[RawSettlement] = []
+    commitments: list[RawCommitment] = []
+    events: list[RawEvent] = []
+
+
+# --- Validated records -----------------------------------------------------------
+
+class Expense(BaseModel):
+    payer: str
+    amount_paise: int = Field(gt=0)
+    description: str
+    participants: list[str] | None
+    split: SplitType
+    shares_paise: dict[str, int] = {}
+    status: ExpenseStatus
+    source_msg_ids: list[str] = Field(min_length=1)
+    flags: list[str] = []
+
+
+class Settlement(BaseModel):
+    from_person: str
+    to_person: str
+    amount_paise: int = Field(gt=0)
+    status: SettlementStatus
+    source_msg_ids: list[str] = Field(min_length=1)
+    flags: list[str] = []
+
+
+class Commitment(BaseModel):
+    owner: str
+    action: str
+    status: CommitmentStatus
+    due_date: date | None = None
+    due_time: time | None = None
+    when_text: str | None = None
+    source_msg_ids: list[str] = Field(min_length=1)
+    flags: list[str] = []
+
+
+class Event(BaseModel):
+    title: str
+    status: EventStatus
+    on_date: date | None = None
+    at_time: time | None = None
+    when_text: str | None = None
+    source_msg_ids: list[str] = Field(min_length=1)
+    flags: list[str] = []
+
+
+class Rejected(BaseModel):
+    """A record the LLM proposed that failed validation. Holds no chat text."""
+    kind: Literal["expense", "settlement", "commitment", "event"]
+    reason: str
+    source_msg_ids: list[str]
