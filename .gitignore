@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Data: never commit DBs or real chats
+data/
+*.db
+*.sqlite3
+chats/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
