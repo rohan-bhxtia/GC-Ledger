@@ -1,0 +1,6 @@
+This line has no timestamp and comes first
+Another orphan line
+14/10/2026, 9:00 pm - Aman: valid message
+31/02/2026, 9:01 pm - Riya: impossible date
+14/10/2026, 25:61 - Karan: impossible time
+14/10/2026, 9:02 pm - Karan: another valid one
