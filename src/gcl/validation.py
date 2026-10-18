@@ -61,6 +61,30 @@ def amounts_in(text: str) -> set[int]:
     return found
 
 
+# --- Head counts ("split 3 ways") -------------------------------------------------------
+
+_COUNT_WORDS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "teen": 3, "char": 4, "chaar": 4, "paanch": 5,
+}
+
+
+def parse_count(text: str | None) -> int | None:
+    if not text:
+        return None
+    value = text.strip().casefold()
+    count = int(value) if value.isdigit() else _COUNT_WORDS.get(value)
+    return count if count is not None and 2 <= count <= 50 else None
+
+
+def count_in(text: str, count: int) -> bool:
+    """Is `count` written in `text`, as digits or a word?"""
+    if re.search(rf"(?<![\d.,]){count}(?![\d.,])", text):
+        return True
+    words = [w for w, n in _COUNT_WORDS.items() if n == count]
+    return any(re.search(rf"\b{w}\b", text, re.I) for w in words)
+
+
 # --- People --------------------------------------------------------------------------
 
 def _norm(text: str) -> str:
@@ -211,6 +235,20 @@ def _expense(raw: RawExpense, ctx: WindowContext) -> Expense:
             raise _Reject("participants and shares disagree")
         participants = list(shares)
 
+    if raw.split is SplitType.EQUAL and raw.split_count:
+        count = parse_count(raw.split_count)
+        if count is None or not count_in(text, count):
+            flags.append("split_count_not_found")
+        elif participants is None:
+            # "split 3 ways" in a chat with exactly 3 people: code fills them in, and says so.
+            if count == len(ctx.participants):
+                participants = list(ctx.participants)
+                flags.append("participants_inferred")
+            else:
+                flags.append("split_count_mismatch")
+        elif count != len(participants):
+            flags.append("split_count_mismatch")
+
     if raw.split is SplitType.EQUAL and participants is None:
         flags.append("participants_unspecified")
     if raw.split is SplitType.UNSPECIFIED:
@@ -254,8 +292,18 @@ def _event(raw: RawEvent, ctx: WindowContext) -> Event:
     if not raw.title.strip():
         raise _Reject("empty title")
     on_date, at_time, when_flags = _when(raw.on_date, raw.at_time, raw.when_text, ids, text, ctx)
+    end_date = None
+    if raw.end_date:
+        try:
+            end = date.fromisoformat(raw.end_date)
+        except ValueError:
+            end = None
+        if end is None or on_date is None or not on_date <= end <= on_date + timedelta(days=366):
+            when_flags.append("invalid_end_date")
+        else:
+            end_date = end
     return Event(
-        title=raw.title.strip(), status=raw.status, on_date=on_date, at_time=at_time,
+        title=raw.title.strip(), status=raw.status, on_date=on_date, end_date=end_date, at_time=at_time,
         when_text=raw.when_text, source_msg_ids=ids, flags=flags + when_flags,
     )
 

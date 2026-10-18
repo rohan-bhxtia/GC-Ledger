@@ -117,7 +117,8 @@ Rules:
   to null.
 - Split: "equal" only if the chat says to split equally or among named people; "exact" when
   individual shares are written (fill shares); otherwise "unspecified". participants = the people
-  sharing the cost, or null if not stated. Never assume the whole group.
+  sharing the cost, or null if not stated. Never assume the whole group. If the number of people
+  is written ("split 3 ways", "teen log"), copy that number into split_count.
 - Expense status: "proposed" for plans or suggestions, "confirmed" when someone says they paid,
   "disputed" when someone objects to the amount or split, "cancelled" when withdrawn.
 - Commitment status: suggested / promised / confirmed / cancelled / completed. Use "completed"
@@ -125,7 +126,8 @@ Rules:
 - Dates: every message has a local timestamp with weekday. Resolve relative dates ("kal",
   "tomorrow", "Sunday") against the timestamp of the message that mentions them. Output dates as
   YYYY-MM-DD and times as HH:MM (24h). Copy the original wording into when_text. If the date is
-  unclear, leave it null. Never guess.
+  unclear, leave it null. Never guess. For multi-day events ("20-23 Dec"), set on_date to the
+  first day and end_date to the last day.
 - Messages with "context_only": true are earlier context. Do not create records supported only
   by them.
 - Messages may be in English, Hindi or Hinglish.
@@ -164,8 +166,11 @@ class ExtractionResult:
     events: list[Event] = field(default_factory=list)
     rejected: list[Rejected] = field(default_factory=list)
     windows: int = 0
+    windows_sent: int = 0
     failed_windows: list[int] = field(default_factory=list)
     skipped_overlap: int = 0
+    processed_ids: set[str] = field(default_factory=set)  # messages whose window succeeded
+    failed_ids: set[str] = field(default_factory=set)     # messages whose window failed
 
 
 def extract(
@@ -176,12 +181,18 @@ def extract(
     gap: timedelta = DEFAULT_GAP,
     max_messages: int = DEFAULT_MAX_MESSAGES,
     overlap: int = DEFAULT_OVERLAP,
+    pending_ids: set[str] | None = None,
 ) -> ExtractionResult:
+    """Extract records. If `pending_ids` is given, only windows containing at least one
+    pending message are sent to the LLM (used for re-imports and retries)."""
     participants = parsed.participants
     windows = build_windows(parsed.messages, gap=gap, max_messages=max_messages, overlap=overlap)
     result = ExtractionResult(windows=len(windows))
 
     for window in windows:
+        if pending_ids is not None and not any(m.msg_id in pending_ids for m in window.messages):
+            continue
+        result.windows_sent += 1
         try:
             raw_json = client.generate_json(
                 system=SYSTEM_PROMPT,
@@ -192,6 +203,7 @@ def extract(
         except (LLMError, ValidationError) as exc:
             logger.warning("Window %d failed: %s", window.index, type(exc).__name__)
             result.failed_windows.append(window.index)
+            result.failed_ids |= {m.msg_id for m in window.messages}
             continue
 
         ctx = WindowContext(
@@ -201,6 +213,7 @@ def extract(
             tz=tz,
         )
         batch = validate_extraction(raw, ctx)
+        result.processed_ids |= ctx.new_ids
         result.expenses += batch.expenses
         result.settlements += batch.settlements
         result.commitments += batch.commitments
@@ -209,9 +222,9 @@ def extract(
         result.skipped_overlap += batch.skipped_overlap
 
     logger.info(
-        "Extraction: %d windows (%d failed), %d expenses, %d settlements, %d commitments, "
+        "Extraction: %d windows (%d sent, %d failed), %d expenses, %d settlements, %d commitments, "
         "%d events, %d rejected",
-        result.windows, len(result.failed_windows), len(result.expenses), len(result.settlements),
+        result.windows, result.windows_sent, len(result.failed_windows), len(result.expenses), len(result.settlements),
         len(result.commitments), len(result.events), len(result.rejected),
     )
     return result

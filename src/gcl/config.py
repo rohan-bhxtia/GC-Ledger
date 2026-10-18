@@ -8,6 +8,7 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+_THINKING_LEVELS = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
 
 
 class Settings(BaseSettings):
@@ -20,8 +21,12 @@ class Settings(BaseSettings):
 
     # LLM (Gemini). Optional here so parsing/ledger commands work without a key.
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = "gemini-2.5-flash"
-    llm_timeout_seconds: int = Field(default=60, gt=0, le=600)
+    gemini_model: str = "gemini-3.8-flash"
+    # Sent to Google as the request deadline, so it must cover the model's thinking time.
+    llm_timeout_seconds: int = Field(default=120, gt=0, le=600)
+    llm_max_attempts: int = Field(default=3, ge=1, le=10)
+    # LOW keeps extraction fast; empty means the model's default (for models without it).
+    gemini_thinking_level: str | None = "LOW"
 
     # Storage
     db_path: Path = Path("data/gcl.db")
@@ -39,6 +44,16 @@ class Settings(BaseSettings):
             ZoneInfo(value)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError(f"Unknown timezone: {value!r}") from exc
+        return value
+
+    @field_validator("gemini_thinking_level")
+    @classmethod
+    def _valid_thinking_level(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        value = value.strip().upper()
+        if value not in _THINKING_LEVELS:
+            raise ValueError(f"gemini_thinking_level must be one of {sorted(_THINKING_LEVELS)} or empty")
         return value
 
     @field_validator("log_level")

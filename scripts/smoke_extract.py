@@ -36,6 +36,8 @@ def main() -> int:
 
     settings = get_settings()
     logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
+    for noisy in ("httpx", "httpcore", "google_genai"):  # per-request INFO lines
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         parsed = parse_chat_file(path, settings=settings)
         client = client_from_settings(settings)
@@ -66,7 +68,8 @@ def main() -> int:
               f"flags={c.flags}\n    <- {src(c.source_msg_ids)}")
     print("EVENTS")
     for ev in result.events:
-        print(f"  {ev.title} [{ev.status.value}] {ev.on_date} {ev.at_time or ''} flags={ev.flags}\n"
+        span = f"{ev.on_date} to {ev.end_date}" if ev.end_date else f"{ev.on_date}"
+        print(f"  {ev.title} [{ev.status.value}] {span} {ev.at_time or ''} flags={ev.flags}\n"
               f"    <- {src(ev.source_msg_ids)}")
     print("REJECTED")
     for r in result.rejected:

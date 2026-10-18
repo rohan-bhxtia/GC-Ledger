@@ -32,9 +32,10 @@ class GeminiClient:
         *,
         api_key: str,
         model: str,
-        timeout_seconds: int = 60,
-        max_attempts: int = 2,
+        timeout_seconds: int = 120,
+        max_attempts: int = 3,
         backoff_seconds: float = 2.0,
+        thinking_level: str | None = None,   # e.g. "LOW"; None = model default
         client: genai.Client | None = None,          # injectable for tests
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -43,6 +44,7 @@ class GeminiClient:
         self.model = model
         self.max_attempts = max_attempts
         self.backoff_seconds = backoff_seconds
+        self.thinking_level = thinking_level
         self._sleep = sleep
         self._client = client or genai.Client(
             api_key=api_key,
@@ -55,6 +57,12 @@ class GeminiClient:
             response_mime_type="application/json",
             response_schema=schema,   # Gemini constrains its output to this schema
             temperature=0,            # extraction, not creativity
+            # No tools are ever given to the model; make that explicit.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            thinking_config=(
+                types.ThinkingConfig(thinking_level=self.thinking_level)
+                if self.thinking_level else None
+            ),
         )
         last_problem = "unknown error"
         for attempt in range(1, self.max_attempts + 1):
@@ -98,4 +106,6 @@ def client_from_settings(settings: Settings | None = None) -> GeminiClient:
         api_key=settings.require_api_key(),
         model=settings.gemini_model,
         timeout_seconds=settings.llm_timeout_seconds,
+        max_attempts=settings.llm_max_attempts,
+        thinking_level=settings.gemini_thinking_level,
     )

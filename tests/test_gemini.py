@@ -76,7 +76,7 @@ def test_transient_failures_are_retried(first_failure):
 
 
 def test_gives_up_after_max_attempts():
-    client, models = make(["bad", "still bad"])
+    client, models = make(["bad", "still bad"], max_attempts=2)
     with pytest.raises(LLMError, match="after 2 attempts"):
         call(client)
     assert len(models.calls) == 2
@@ -104,6 +104,28 @@ def test_backoff_between_attempts():
                           max_attempts=3, backoff_seconds=2, sleep=pauses.append)
     call(client)
     assert pauses == [2, 4]
+
+
+@pytest.mark.parametrize("level,expected", [("LOW", "LOW"), (None, None)])
+def test_thinking_level_is_sent_only_when_set(level, expected):
+    client, models = make([VALID], thinking_level=level)
+    call(client)
+    thinking = models.calls[0].config.thinking_config
+    if expected is None:
+        assert thinking is None
+    else:
+        assert thinking.thinking_level == expected
+
+
+def test_settings_reach_the_client(monkeypatch):
+    monkeypatch.setenv("GCL_GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GCL_LLM_MAX_ATTEMPTS", "4")
+    monkeypatch.setenv("GCL_GEMINI_THINKING_LEVEL", "")
+    settings = Settings(_env_file=None)
+    assert settings.llm_timeout_seconds == 120
+    client = client_from_settings(settings)
+    assert client.max_attempts == 4
+    assert client.thinking_level is None
 
 
 def test_missing_key_fails_before_any_request(monkeypatch):

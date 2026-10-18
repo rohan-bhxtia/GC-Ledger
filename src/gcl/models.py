@@ -121,6 +121,7 @@ class RawExpense(BaseModel):
     description: str = ""
     participants: list[str] | None = None   # None = not stated
     split: SplitType = SplitType.UNSPECIFIED
+    split_count: str | None = None          # number of ways as written, e.g. "3" in "split 3 ways"
     shares: list[RawShare] = []
     status: ExpenseStatus
     source_msg_ids: list[str] = []
@@ -147,7 +148,8 @@ class RawCommitment(BaseModel):
 class RawEvent(BaseModel):
     title: str
     status: EventStatus
-    on_date: str | None = None     # YYYY-MM-DD
+    on_date: str | None = None     # YYYY-MM-DD (first day)
+    end_date: str | None = None    # YYYY-MM-DD, multi-day events only
     at_time: str | None = None     # HH:MM
     when_text: str | None = None
     source_msg_ids: list[str] = []
@@ -198,6 +200,7 @@ class Event(BaseModel):
     title: str
     status: EventStatus
     on_date: date | None = None
+    end_date: date | None = None
     at_time: time | None = None
     when_text: str | None = None
     source_msg_ids: list[str] = Field(min_length=1)
