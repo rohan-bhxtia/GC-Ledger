@@ -128,6 +128,37 @@ def test_settings_reach_the_client(monkeypatch):
     assert client.thinking_level is None
 
 
+def test_quota_failure_is_reported_as_quota_exhausted():
+    from gcl.extractor import QuotaExhausted
+    quota = api_error(errors.ClientError, 429, "RESOURCE_EXHAUSTED")
+    client, _ = make([quota, quota], max_attempts=2)
+    with pytest.raises(QuotaExhausted):
+        call(client)
+
+
+def rate_limited(retry_delay):
+    return errors.ClientError(429, {"error": {
+        "code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota",
+        "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}],
+    }})
+
+
+def test_per_minute_limit_waits_as_long_as_google_asks():
+    pauses = []
+    models = FakeModels([rate_limited("30s"), VALID])
+    client = GeminiClient(api_key="x", model="m", client=SimpleNamespace(models=models), sleep=pauses.append)
+    assert call(client) == VALID
+    assert pauses == [31]
+
+
+def test_daily_quota_stops_without_retrying():
+    from gcl.extractor import QuotaExhausted
+    client, models = make([rate_limited("33743s"), VALID])
+    with pytest.raises(QuotaExhausted, match="daily quota"):
+        call(client)
+    assert len(models.calls) == 1
+
+
 def test_missing_key_fails_before_any_request(monkeypatch):
     monkeypatch.delenv("GCL_GEMINI_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="GCL_GEMINI_API_KEY"):

@@ -98,3 +98,24 @@ def test_import_history_is_recorded(db, settings):
     report = import_chat(FIXTURE, chat_name="Goa", db=db, client=FakeLLM(), settings=settings)
     row = db.conn.execute("SELECT * FROM imports WHERE chat_id = ?", (report.chat_id,)).fetchone()
     assert (row["messages_new"], row["windows_sent"], row["records_new"]) == (11, 3, 1)
+
+def test_interrupted_run_keeps_finished_batches(db, settings):
+    """Villa is in window 0; stop (Ctrl+C) during window 1: batch 0 is already saved."""
+    class StopAfterFirst(FakeLLM):
+        def generate_json(self, **kwargs):
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            return super().generate_json(**kwargs)
+
+    seen = []
+    with pytest.raises(KeyboardInterrupt):
+        import_chat(FIXTURE, chat_name="Goa", db=db, client=StopAfterFirst(), settings=settings,
+                    batch_windows=1, progress=lambda done, total: seen.append((done, total)))
+    chat_id = db.find_chat("Goa")
+    assert len(db.records(chat_id, "expense")) == 1         # villa saved before the stop
+    assert seen == [(1, 3)]
+
+    llm = FakeLLM()
+    import_chat(FIXTURE, chat_name="Goa", db=db, client=llm, settings=settings)
+    assert llm.calls == 2                                    # only the 2 unfinished windows
+    assert db.pending_message_ids(chat_id) == set()

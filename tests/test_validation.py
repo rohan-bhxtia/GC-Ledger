@@ -146,10 +146,14 @@ def test_exact_split_must_add_up(chat):
     assert "add up" in run(ctx, expenses=[raw]).rejected[0].reason
 
 
-def test_exact_split_needs_shares(chat):
+def test_exact_split_without_shares_is_kept_for_review(chat):
     ids, ctx = chat
     raw = expense(ids, split=SplitType.EXACT)
-    assert "without shares" in run(ctx, expenses=[raw]).rejected[0].reason
+    result = run(ctx, expenses=[raw])
+    assert not result.rejected
+    e = result.expenses[0]
+    assert e.split is SplitType.UNSPECIFIED
+    assert {"exact_split_without_shares", "split_unspecified"} <= set(e.flags)
 
 
 def test_unspecified_split_and_participants_are_flagged(chat):

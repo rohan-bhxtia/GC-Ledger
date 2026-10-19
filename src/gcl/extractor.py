@@ -40,6 +40,10 @@ class LLMError(RuntimeError):
     """The model call failed (timeout, quota, network, refusal)."""
 
 
+class QuotaExhausted(LLMError):
+    """The API quota is used up; further calls would fail too."""
+
+
 class LLMClient(Protocol):
     def generate_json(self, *, system: str, user: str, schema: type[BaseModel]) -> str:
         """Return a JSON string that should match `schema`."""
@@ -128,6 +132,8 @@ Rules:
   YYYY-MM-DD and times as HH:MM (24h). Copy the original wording into when_text. If the date is
   unclear, leave it null. Never guess. For multi-day events ("20-23 Dec"), set on_date to the
   first day and end_date to the last day.
+- Times: set at_time / due_time only when a time is written in a message ("6pm", "9 baje").
+  A message's own timestamp is when it was sent, not the time of the plan.
 - Messages with "context_only": true are earlier context. Do not create records supported only
   by them.
 - Messages may be in English, Hindi or Hinglish.
@@ -171,6 +177,7 @@ class ExtractionResult:
     skipped_overlap: int = 0
     processed_ids: set[str] = field(default_factory=set)  # messages whose window succeeded
     failed_ids: set[str] = field(default_factory=set)     # messages whose window failed
+    quota_exhausted: bool = False                         # stopped early; the rest stays pending
 
 
 def extract(
@@ -192,6 +199,10 @@ def extract(
     for window in windows:
         if pending_ids is not None and not any(m.msg_id in pending_ids for m in window.messages):
             continue
+        if result.quota_exhausted:  # not sent; counts as failed so it is retried next import
+            result.failed_windows.append(window.index)
+            result.failed_ids |= {m.msg_id for m in window.messages}
+            continue
         result.windows_sent += 1
         try:
             raw_json = client.generate_json(
@@ -204,6 +215,9 @@ def extract(
             logger.warning("Window %d failed: %s", window.index, type(exc).__name__)
             result.failed_windows.append(window.index)
             result.failed_ids |= {m.msg_id for m in window.messages}
+            if isinstance(exc, QuotaExhausted):
+                logger.warning("Gemini quota used up; stopping. The rest is retried next import.")
+                result.quota_exhausted = True
             continue
 
         ctx = WindowContext(

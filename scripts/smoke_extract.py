@@ -2,7 +2,8 @@
 
     python scripts/smoke_extract.py tests/fixtures/android_dmy_12h.txt
 
-Sends message text to Google Gemini. Restricted to tests/fixtures/ unless you pass
+Sends message text to the configured LLM (Google Gemini unless GCL_LLM_PROVIDER=ollama).
+Restricted to tests/fixtures/ unless you pass
 --allow-real-chat, so a real conversation is never sent by accident.
 """
 
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from gcl.config import get_settings
 from gcl.extractor import build_windows, extract
-from gcl.gemini import client_from_settings
+from gcl.llm import client_from_settings
 from gcl.parser import ParseError, parse_chat_file
 
 FIXTURES = (Path(__file__).resolve().parent.parent / "tests" / "fixtures").resolve()
@@ -47,7 +48,7 @@ def main() -> int:
 
     windows = build_windows(parsed.messages)
     sent = sum(len(w.all_messages) for w in windows)
-    print(f"Sending {sent} messages in {len(windows)} windows to Gemini ({settings.gemini_model})...\n")
+    print(f"Sending {sent} messages in {len(windows)} windows to {settings.llm_label}...\n")
     result = extract(parsed, client, tz=settings.tz)
     text_of = {m.msg_id: m.text.replace("\n", " / ") for m in parsed.messages}
 

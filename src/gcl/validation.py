@@ -216,10 +216,13 @@ def _expense(raw: RawExpense, ctx: WindowContext) -> Expense:
             raise _Reject("same person has two shares")
         shares[person] = _grounded_amount(share.amount_text, text, "share amount")
 
-    if shares and raw.split is not SplitType.EXACT:
+    split = raw.split
+    if shares and split is not SplitType.EXACT:
         raise _Reject("shares given but split is not 'exact'")
-    if raw.split is SplitType.EXACT and not shares:
-        raise _Reject("exact split without shares")
+    if split is SplitType.EXACT and not shares:
+        # The expense itself is still grounded; only the split is unclear. Keep it for review.
+        split = SplitType.UNSPECIFIED
+        flags.append("exact_split_without_shares")
 
     if raw.amount_text:
         total = _grounded_amount(raw.amount_text, text, "amount")
@@ -235,7 +238,7 @@ def _expense(raw: RawExpense, ctx: WindowContext) -> Expense:
             raise _Reject("participants and shares disagree")
         participants = list(shares)
 
-    if raw.split is SplitType.EQUAL and raw.split_count:
+    if split is SplitType.EQUAL and raw.split_count:
         count = parse_count(raw.split_count)
         if count is None or not count_in(text, count):
             flags.append("split_count_not_found")
@@ -249,14 +252,14 @@ def _expense(raw: RawExpense, ctx: WindowContext) -> Expense:
         elif count != len(participants):
             flags.append("split_count_mismatch")
 
-    if raw.split is SplitType.EQUAL and participants is None:
+    if split is SplitType.EQUAL and participants is None:
         flags.append("participants_unspecified")
-    if raw.split is SplitType.UNSPECIFIED:
+    if split is SplitType.UNSPECIFIED:
         flags.append("split_unspecified")
 
     return Expense(
         payer=payer, amount_paise=total, description=raw.description.strip(),
-        participants=participants, split=raw.split, shares_paise=shares,
+        participants=participants, split=split, shares_paise=shares,
         status=raw.status, source_msg_ids=ids, flags=flags,
     )
 

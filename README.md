@@ -24,7 +24,7 @@ WhatsApp export (.txt / .zip)
         │
         ▼
   validation.py  → checks every record against the original messages
-        │
+        │ 
         ▼
   Expenses · Settlements · Commitments · Events · Rejected
 ```

@@ -146,6 +146,18 @@ def test_failed_window_is_reported_and_others_continue(reply):
     assert result.failed_windows == [0]
 
 
+
+def test_quota_exhausted_stops_and_leaves_the_rest_pending():
+    from gcl.extractor import QuotaExhausted
+    chat = "14/10/2026, 9:00 am - A: one\n14/10/2026, 6:00 pm - B: two\n15/10/2026, 9:00 am - A: three\n"
+    parsed = parse_chat_text(chat, tz=IST)
+    llm = FakeLLM(lambda _: QuotaExhausted("429"))
+    result = extract(parsed, llm, tz=IST)
+    assert len(llm.calls) == 1                     # no calls after the quota error
+    assert result.quota_exhausted
+    assert result.failed_windows == [0, 1, 2]      # unsent windows are retried next import
+    assert result.failed_ids == {m.msg_id for m in parsed.messages}
+
 def test_logs_contain_no_chat_content(caplog, android_parsed):
     with caplog.at_level(logging.DEBUG, logger="gcl"):
         extract(android_parsed, FakeLLM(lambda _: "not json"), tz=IST)
