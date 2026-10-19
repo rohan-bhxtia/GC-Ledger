@@ -93,7 +93,6 @@ def test_debts_are_simplified():
     ({"status": ExpenseStatus.PROPOSED}, False),
     ({"status": ExpenseStatus.CANCELLED}, False),
     ({"status": ExpenseStatus.DISPUTED}, True),
-    ({"flags": ["possible_duplicate"]}, True),
     ({"flags": ["participants_unspecified"], "participants": None}, True),
     ({"flags": ["split_unspecified"]}, True),
     ({"flags": ["suspicious_instruction_text"]}, True),

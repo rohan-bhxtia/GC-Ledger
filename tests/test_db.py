@@ -64,7 +64,7 @@ def test_amount_check_constraint(db, chat):
 
 def test_sql_in_chat_text_is_just_data(db, chat):
     chat_id, ids, _ = chat
-    stored = db.get_messages(chat_id, [ids[5]])[0]
+    stored = next(m for m in db.get_messages(chat_id) if m.msg_id == ids[5])
     assert stored.text == "'); DROP TABLE records; --"
     assert db.records(chat_id, "expense") == []  # table still exists
 
@@ -129,15 +129,12 @@ def test_newer_evidence_updates_status_older_does_not(db, chat):
     assert db.records(chat_id, "expense")[0].record.status is ExpenseStatus.CONFIRMED
 
 
-def test_same_amount_without_shared_source_is_flagged_not_merged(db, chat):
+def test_same_amount_without_shared_source_is_kept_separately(db, chat):
     chat_id, ids, _ = chat
     db.save_records(chat_id, "expense", [expense([ids[2]])])
-    near = db.save_records(chat_id, "expense", [expense([ids[3]])])    # next morning
-    far = db.save_records(chat_id, "expense", [expense([ids[4]], description="movie")])  # 6 days later
-    assert (near.inserted, near.possible_duplicates) == (1, 1)
-    assert (far.inserted, far.possible_duplicates) == (1, 0)
-    flags = [s.record.flags for s in db.records(chat_id, "expense")]
-    assert flags == [[], ["possible_duplicate"], []]
+    second = db.save_records(chat_id, "expense", [expense([ids[3]])])  # same payer and amount
+    assert (second.inserted, second.merged) == (1, 0)
+    assert len(db.records(chat_id, "expense")) == 2
 
 
 # --- Delete -----------------------------------------------------------------------------------
@@ -145,13 +142,11 @@ def test_same_amount_without_shared_source_is_flagged_not_merged(db, chat):
 def test_delete_chat_removes_everything_and_only_that_chat(db, chat):
     chat_id, ids, msgs = chat
     db.save_records(chat_id, "expense", [expense([ids[2]])])
-    db.record_import(chat_id, messages_total=6, messages_new=6, windows_sent=1,
-                     windows_failed=0, records_new=1, records_merged=0, rejected=0)
     other = db.get_or_create_chat("Family")
     db.add_messages(other, msgs)
 
     assert db.delete_chat(chat_id) is True
-    for table in ("records", "record_sources", "imports"):
+    for table in ("records", "record_sources"):
         assert db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     assert db.conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()[0] == 0
     assert len(db.get_messages(other)) == len(msgs)

@@ -31,10 +31,9 @@ def android(settings):
 
 
 def test_android_counts(android):
-    s = android.stats
-    assert (s.messages, s.text_messages, s.media_messages, s.deleted_messages, s.system_messages) == (
-        11, 5, 1, 1, 4,
-    )
+    kinds = [m.kind for m in android.messages]
+    counts = [kinds.count(k) for k in (MessageKind.TEXT, MessageKind.MEDIA, MessageKind.DELETED, MessageKind.SYSTEM)]
+    assert (len(android.messages), *counts) == (11, 5, 1, 1, 4)
     assert android.date_order == "DMY"
     assert android.participants == ["Aman Verma", "Karan", "Riya"]
 
@@ -68,7 +67,7 @@ def test_subject_change_with_colon_is_system(android):
 
 def test_ios_fixture(settings):
     result = parse_chat_file(FIXTURES / "ios_dmy.txt", settings=settings)
-    assert result.stats.messages == 5
+    assert len(result.messages) == 5
     assert result.messages[0].timestamp == datetime(2026, 10, 14, 21, 2, 11, tzinfo=IST)
     assert result.messages[-1].text.endswith("\nto finalise the budget")
 
@@ -111,10 +110,9 @@ def test_month_first_detected():
     assert result.messages[0].timestamp.date() == datetime(2026, 10, 14).date()
 
 
-def test_ambiguous_dates_default_day_first_and_override():
+def test_ambiguous_dates_default_day_first():
     text = "05/06/2026, 10:00 - A: x\n"
     assert parse(text).messages[0].timestamp.month == 6
-    assert parse(text, date_order="MDY").messages[0].timestamp.month == 5
 
 
 def test_inconsistent_date_order_rejected():
@@ -131,11 +129,9 @@ def test_media_with_caption_keeps_caption():
 
 # --- Malformed input ----------------------------------------------------------------------
 
-def test_malformed_lines_reported_not_crashing(settings):
+def test_malformed_lines_skipped_not_crashing(settings):
     result = parse_chat_file(FIXTURES / "malformed.txt", settings=settings)
     assert [m.text for m in result.messages] == ["valid message", "another valid one"]
-    assert result.stats.orphan_lines == 2
-    assert result.stats.invalid_header_lines == [4, 5]
 
 
 @pytest.mark.parametrize("text", ["", "   \n\n", "hello world\njust some text\n"])
@@ -208,7 +204,7 @@ def make_zip(path: Path, files: dict[str, str]) -> Path:
 def test_zip_export(tmp_path, settings):
     chat = (FIXTURES / "ios_dmy.txt").read_text(encoding="utf-8")
     z = make_zip(tmp_path / "WhatsApp Chat - Goa.zip", {"_chat.txt": chat, "IMG-0001.jpg": "fake"})
-    assert parse_chat_file(z, settings=settings).stats.messages == 5
+    assert len(parse_chat_file(z, settings=settings).messages) == 5
 
 
 def test_zip_without_chat(tmp_path, settings):

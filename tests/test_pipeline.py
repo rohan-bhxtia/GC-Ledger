@@ -94,10 +94,9 @@ def test_bad_file_writes_nothing(db, settings, tmp_path):
     assert db.list_chats() == []
 
 
-def test_import_history_is_recorded(db, settings):
+def test_import_report_counts(db, settings):
     report = import_chat(FIXTURE, chat_name="Goa", db=db, client=FakeLLM(), settings=settings)
-    row = db.conn.execute("SELECT * FROM imports WHERE chat_id = ?", (report.chat_id,)).fetchone()
-    assert (row["messages_new"], row["windows_sent"], row["records_new"]) == (11, 3, 1)
+    assert (report.messages_new, report.windows_sent, report.records_new) == (11, 3, 1)
 
 def test_interrupted_run_keeps_finished_batches(db, settings):
     """Villa is in window 0; stop (Ctrl+C) during window 1: batch 0 is already saved."""

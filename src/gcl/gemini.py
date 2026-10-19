@@ -1,10 +1,18 @@
-"""Gemini implementation of extractor.LLMClient.
+"""Talk to Google Gemini.
 
-DATA FLOW: calling generate_json() sends the prompt (chat message text, sender
-names, timestamps) to Google's Gemini API. Callers must make that clear to the
-user before sending a real chat. Nothing is sent at import or construction time.
+DATA: calling generate_json() sends the prompt (message text, sender names, times) to Google.
+The app asks the user before the first send. Nothing is sent when this file is imported or
+when the client is created.
 
-Errors are reported by type/status code only, never with prompt or response text.
+What happens when something goes wrong:
+  - Bad request, bad key, unknown model (400/401/403/404): stop at once. Retrying won't help.
+  - Server error, timeout, network problem, or a reply in the wrong shape: try again,
+    waiting a little longer each time (2 s, then 4 s, ...).
+  - Too many requests (429):
+      * per-minute limit: Google says how long to wait (e.g. 30 s). We wait that long, then retry.
+      * daily limit: Google says to wait hours. We stop at once with QuotaExhausted.
+
+Error messages contain only status codes, never the prompt or the reply.
 """
 
 from __future__ import annotations
@@ -24,21 +32,30 @@ from gcl.extractor import LLMError, QuotaExhausted
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_CLIENT_CODES = {408, 429}  # timeout, rate limit
-# A 429 asking us to wait longer than this is a daily quota, not a per-minute limit.
-_MAX_RATE_LIMIT_WAIT = 120.0
+RETRYABLE_CLIENT_CODES = {408, 429}  # 408 = timeout, 429 = too many requests
+# If a 429 asks us to wait longer than this, it's the daily quota, not the per-minute limit.
+MAX_RATE_LIMIT_WAIT_SECONDS = 120.0
 
 
-def _retry_delay(exc: errors.APIError) -> float | None:
-    """Seconds Google asks us to wait before retrying, if it says."""
-    details = exc.details if isinstance(exc.details, dict) else {}
+class _TryAgain(Exception):
+    """An odd reply (e.g. empty) that's worth retrying."""
+
+
+def _wait_google_asks_for(error: errors.APIError) -> float | None:
+    """How many seconds Google tells us to wait before retrying, if it says."""
+    # Usually it's in the error details as {"@type": "...RetryInfo", "retryDelay": "33s"}.
+    details = error.details if isinstance(error.details, dict) else {}
     for item in (details.get("error") or {}).get("details") or []:
         if isinstance(item, dict) and str(item.get("@type", "")).endswith("RetryInfo"):
             match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(item.get("retryDelay", "")))
             if match:
                 return float(match.group(1))
-    match = re.search(r"retry in (\d+(?:\.\d+)?)s", exc.message or "")
-    return float(match.group(1)) if match else None
+
+    # Sometimes only the message says it: "... Please retry in 33.5s."
+    match = re.search(r"retry in (\d+(?:\.\d+)?)s", error.message or "")
+    if match:
+        return float(match.group(1))
+    return None
 
 
 class GeminiClient:
@@ -50,9 +67,9 @@ class GeminiClient:
         timeout_seconds: int = 120,
         max_attempts: int = 3,
         backoff_seconds: float = 2.0,
-        thinking_level: str | None = None,   # e.g. "LOW"; None = model default
-        client: genai.Client | None = None,          # injectable for tests
-        sleep: Callable[[float], None] = time.sleep,
+        thinking_level: str | None = None,          # e.g. "LOW"; None = the model's default
+        client: genai.Client | None = None,          # the tests pass a fake one
+        sleep: Callable[[float], None] = time.sleep,  # the tests pass a fake one
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -63,67 +80,73 @@ class GeminiClient:
         self._sleep = sleep
         self._client = client or genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=timeout_seconds * 1000),  # milliseconds
+            http_options=types.HttpOptions(timeout=timeout_seconds * 1000),  # in milliseconds
         )
 
     def generate_json(self, *, system: str, user: str, schema: type[BaseModel]) -> str:
+        thinking = None
+        if self.thinking_level:
+            thinking = types.ThinkingConfig(thinking_level=self.thinking_level)
+
         config = types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json",
-            response_schema=schema,   # Gemini constrains its output to this schema
-            temperature=0,            # extraction, not creativity
-            # No tools are ever given to the model; make that explicit.
+            response_schema=schema,   # Gemini must reply with JSON in this shape
+            temperature=0,            # same input -> same answer
+            thinking_config=thinking,
+            # We never give the model tools; say so explicitly.
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            thinking_config=(
-                types.ThinkingConfig(thinking_level=self.thinking_level)
-                if self.thinking_level else None
-            ),
         )
+
         last_problem = "unknown error"
         for attempt in range(1, self.max_attempts + 1):
-            wait = self.backoff_seconds * attempt
+            normal_wait = self.backoff_seconds * attempt   # 2 s, 4 s, 6 s, ...
+            wait = normal_wait
+
             try:
                 response = self._client.models.generate_content(
                     model=self.model, contents=user, config=config
                 )
                 text = response.text
                 if not text:
-                    raise _Retryable("empty response (possibly blocked)")
-                schema.model_validate_json(text)  # retry once on malformed output
+                    raise _TryAgain("empty response (possibly blocked)")
+                schema.model_validate_json(text)  # is it really the right shape?
                 return text
-            except errors.ClientError as exc:
-                if exc.code not in _RETRYABLE_CLIENT_CODES:
-                    # 400 bad request, 401/403 bad key, 404 unknown model: retrying won't help.
-                    raise LLMError(f"Gemini rejected the request ({exc.code} {exc.status})") from None
-                last_problem = f"{exc.code} {exc.status}"
-                delay = _retry_delay(exc) if exc.code == 429 else None
-                if delay is not None and delay > _MAX_RATE_LIMIT_WAIT:
-                    raise QuotaExhausted(
-                        f"Gemini daily quota used up ({last_problem}); resets in about {delay / 3600:.1f} h"
-                    ) from None
-                if delay is not None:  # per-minute limit: wait as long as Google asks
-                    wait = max(wait, delay + 1)
-            except errors.ServerError as exc:
-                last_problem = f"{exc.code} {exc.status}"
-            except httpx.TransportError as exc:  # timeouts, connection failures
-                last_problem = type(exc).__name__
+
+            except errors.ClientError as error:
+                if error.code not in RETRYABLE_CLIENT_CODES:
+                    raise LLMError(f"Gemini rejected the request ({error.code} {error.status})") from None
+                last_problem = f"{error.code} {error.status}"
+
+                if error.code == 429:
+                    asked_wait = _wait_google_asks_for(error)
+                    if asked_wait is not None and asked_wait > MAX_RATE_LIMIT_WAIT_SECONDS:
+                        hours = asked_wait / 3600
+                        raise QuotaExhausted(
+                            f"Gemini daily quota used up ({last_problem}); resets in about {hours:.1f} h"
+                        ) from None
+                    if asked_wait is not None:
+                        wait = max(wait, asked_wait + 1)
+
+            except errors.ServerError as error:
+                last_problem = f"{error.code} {error.status}"
+            except httpx.TransportError as error:  # timeouts, connection failures
+                last_problem = type(error).__name__
             except ValidationError:
                 last_problem = "response did not match schema"
-            except _Retryable as exc:
-                last_problem = str(exc)
+            except _TryAgain as error:
+                last_problem = str(error)
 
             logger.warning("Gemini attempt %d/%d failed: %s", attempt, self.max_attempts, last_problem)
             if attempt < self.max_attempts:
-                if wait > self.backoff_seconds * attempt:
+                if wait > normal_wait:
                     logger.warning("Gemini rate limit; waiting %.0f s before retrying", wait)
                 self._sleep(wait)
 
-        error = QuotaExhausted if last_problem.startswith("429") else LLMError
-        raise error(f"Gemini failed after {self.max_attempts} attempts: {last_problem}")
-
-
-class _Retryable(Exception):
-    pass
+        # Every attempt failed. If the last problem was 429, treat it as the quota.
+        if last_problem.startswith("429"):
+            raise QuotaExhausted(f"Gemini failed after {self.max_attempts} attempts: {last_problem}")
+        raise LLMError(f"Gemini failed after {self.max_attempts} attempts: {last_problem}")
 
 
 def client_from_settings(settings: Settings | None = None) -> GeminiClient:

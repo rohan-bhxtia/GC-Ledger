@@ -1,13 +1,18 @@
-"""Chat messages -> validated expenses, settlements, commitments and events.
+"""Send the chat to the LLM, piece by piece, and collect the checked records.
 
-Pipeline: build conversation windows -> render prompt -> LLM (structured JSON)
-          -> parse into Raw* schemas -> deterministic validation (gcl.validation).
+How it works:
 
-The LLM client is injected (see LLMClient), so this module is tested with a fake
-and the Gemini implementation is added separately.
+  1. build_windows()  cuts the chat into "windows": groups of messages that belong to the
+                      same conversation (a gap of 3+ hours starts a new one).
+  2. render_window()  turns one window into the text we send to the LLM.
+  3. extract()        sends each window, reads the JSON reply and passes it to
+                      validation.py, which decides what to keep.
 
-Privacy: only TEXT messages and media captions are sent to the LLM; system and
-deleted messages never leave the machine. Logs contain counts only.
+The LLM itself is passed in as `client` (anything with a generate_json method), so this file
+works the same with Gemini, Ollama, or a fake LLM in the tests.
+
+Privacy: only text messages and media captions are sent. System and deleted messages never
+leave the machine.
 """
 
 from __future__ import annotations
@@ -29,34 +34,42 @@ from gcl.validation import WindowContext, validate_extraction
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GAP = timedelta(hours=3)
-DEFAULT_MAX_MESSAGES = 80
-DEFAULT_OVERLAP = 5
+# Window settings
+GAP_BETWEEN_CONVERSATIONS = timedelta(hours=3)  # a longer silence starts a new window
+MAX_MESSAGES_PER_WINDOW = 80                    # keeps each LLM request a sensible size
+OVERLAP_MESSAGES = 5                            # last few messages of the previous window,
+                                                # sent again as background context
 
 
-# --- LLM client interface ---------------------------------------------------------------
+# =============================================================================
+# What an LLM client must look like
+# =============================================================================
 
 class LLMError(RuntimeError):
-    """The model call failed (timeout, quota, network, refusal)."""
+    """The LLM call failed (timeout, quota, network, refusal)."""
 
 
 class QuotaExhausted(LLMError):
-    """The API quota is used up; further calls would fail too."""
+    """The API quota is used up, so more calls would fail too. Stop and try later."""
 
 
 class LLMClient(Protocol):
+    """Anything with this method can be used as the LLM (Gemini, Ollama, a test fake)."""
+
     def generate_json(self, *, system: str, user: str, schema: type[BaseModel]) -> str:
-        """Return a JSON string that should match `schema`."""
+        """Send the prompt and return the reply as a JSON string matching `schema`."""
         ...
 
 
-# --- Conversation windows -------------------------------------------------------------------
+# =============================================================================
+# Step 1: cut the chat into windows
+# =============================================================================
 
 @dataclass(frozen=True)
 class Window:
     index: int
-    context: tuple[Message, ...]    # overlap from the previous window (read-only context)
-    messages: tuple[Message, ...]   # messages this window is responsible for
+    context: tuple[Message, ...]    # overlap from the previous window (background only)
+    messages: tuple[Message, ...]   # the messages this window is responsible for
 
     @property
     def all_messages(self) -> tuple[Message, ...]:
@@ -64,39 +77,56 @@ class Window:
 
 
 def is_eligible(message: Message) -> bool:
-    """Only real text (and media captions) is worth sending to the LLM."""
+    """Is this message worth sending to the LLM? Text yes; media only if it has a caption."""
     if message.kind is MessageKind.TEXT:
         return bool(message.text.strip())
-    return message.kind is MessageKind.MEDIA and "\n" in message.text  # placeholder + caption
+    if message.kind is MessageKind.MEDIA:
+        # A media message with a caption has the placeholder on line 1 and the caption below.
+        return "\n" in message.text
+    return False
 
 
 def build_windows(
     messages: list[Message],
     *,
-    gap: timedelta = DEFAULT_GAP,
-    max_messages: int = DEFAULT_MAX_MESSAGES,
-    overlap: int = DEFAULT_OVERLAP,
+    gap: timedelta = GAP_BETWEEN_CONVERSATIONS,
+    max_messages: int = MAX_MESSAGES_PER_WINDOW,
+    overlap: int = OVERLAP_MESSAGES,
 ) -> list[Window]:
-    if max_messages < 1 or not 0 <= overlap < max_messages:
+    """Group the chat into windows of related messages."""
+    if max_messages < 1 or overlap < 0 or overlap >= max_messages:
         raise ValueError("need max_messages >= 1 and 0 <= overlap < max_messages")
 
-    eligible = [m for m in messages if is_eligible(m)]
-    segments: list[list[Message]] = []
-    for message in eligible:
-        if segments and message.timestamp - segments[-1][-1].timestamp <= gap:
-            segments[-1].append(message)
+    # 1. Split into conversations wherever there is a long silence.
+    conversations: list[list[Message]] = []
+    for message in messages:
+        if not is_eligible(message):
+            continue
+        if conversations and message.timestamp - conversations[-1][-1].timestamp <= gap:
+            conversations[-1].append(message)
         else:
-            segments.append([message])
+            conversations.append([message])
 
-    pieces = [seg[i:i + max_messages] for seg in segments for i in range(0, len(seg), max_messages)]
+    # 2. Cut long conversations into pieces of at most `max_messages`.
+    pieces: list[list[Message]] = []
+    for conversation in conversations:
+        for start in range(0, len(conversation), max_messages):
+            pieces.append(conversation[start:start + max_messages])
+
+    # 3. Each window also gets the last few messages of the previous piece as context.
     windows: list[Window] = []
     for index, piece in enumerate(pieces):
-        context = tuple(pieces[index - 1][-overlap:]) if index and overlap else ()
+        if index > 0 and overlap > 0:
+            context = tuple(pieces[index - 1][-overlap:])
+        else:
+            context = ()
         windows.append(Window(index=index, context=context, messages=tuple(piece)))
     return windows
 
 
-# --- Prompt -------------------------------------------------------------------------------------
+# =============================================================================
+# Step 2: the prompt
+# =============================================================================
 
 SYSTEM_PROMPT = """\
 You extract structured records from a WhatsApp group chat for a shared-expense and plans ledger.
@@ -142,19 +172,25 @@ Rules:
 
 
 def render_window(window: Window, participants: list[str], tz: ZoneInfo) -> str:
-    """User prompt. Each message is one JSON object, so message text cannot break out of its slot."""
+    """Build the text we send to the LLM for one window.
+
+    Each message becomes one line of JSON. That way a message can't "escape" its slot and
+    pretend to be part of our instructions.
+    """
     context_ids = {m.msg_id for m in window.context}
+
     lines = []
-    for m in window.all_messages:
+    for message in window.all_messages:
         item = {
-            "id": m.msg_id,
-            "time": m.timestamp.astimezone(tz).strftime("%Y-%m-%d %H:%M %a"),
-            "sender": m.sender,
-            "text": m.text,
+            "id": message.msg_id,
+            "time": message.timestamp.astimezone(tz).strftime("%Y-%m-%d %H:%M %a"),
+            "sender": message.sender,
+            "text": message.text,
         }
-        if m.msg_id in context_ids:
+        if message.msg_id in context_ids:
             item["context_only"] = True
         lines.append(json.dumps(item, ensure_ascii=False))
+
     return (
         f"Participants: {json.dumps(participants, ensure_ascii=False)}\n"
         f"Timezone: {tz.key}\n"
@@ -162,7 +198,9 @@ def render_window(window: Window, participants: list[str], tz: ZoneInfo) -> str:
     )
 
 
-# --- Orchestration ---------------------------------------------------------------------------------
+# =============================================================================
+# Step 3: send the windows and collect the results
+# =============================================================================
 
 @dataclass
 class ExtractionResult:
@@ -171,13 +209,11 @@ class ExtractionResult:
     commitments: list[Commitment] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     rejected: list[Rejected] = field(default_factory=list)
-    windows: int = 0
-    windows_sent: int = 0
+    windows: int = 0                                   # how many windows we were given
+    windows_sent: int = 0                              # how many we actually sent
     failed_windows: list[int] = field(default_factory=list)
-    skipped_overlap: int = 0
-    processed_ids: set[str] = field(default_factory=set)  # messages whose window succeeded
-    failed_ids: set[str] = field(default_factory=set)     # messages whose window failed
-    quota_exhausted: bool = False                         # stopped early; the rest stays pending
+    failed_ids: set[str] = field(default_factory=set)  # messages in failed windows (retry later)
+    quota_exhausted: bool = False                      # we stopped early because of the quota
 
 
 def extract(
@@ -185,60 +221,64 @@ def extract(
     client: LLMClient,
     *,
     tz: ZoneInfo,
-    gap: timedelta = DEFAULT_GAP,
-    max_messages: int = DEFAULT_MAX_MESSAGES,
-    overlap: int = DEFAULT_OVERLAP,
-    pending_ids: set[str] | None = None,
+    windows: list[Window] | None = None,
 ) -> ExtractionResult:
-    """Extract records. If `pending_ids` is given, only windows containing at least one
-    pending message are sent to the LLM (used for re-imports and retries)."""
+    """Send windows to the LLM and return the records that pass validation.
+
+    `windows`: which windows to send. Leave it out to send the whole chat.
+    """
+    if windows is None:
+        windows = build_windows(parsed.messages)
     participants = parsed.participants
-    windows = build_windows(parsed.messages, gap=gap, max_messages=max_messages, overlap=overlap)
     result = ExtractionResult(windows=len(windows))
 
     for window in windows:
-        if pending_ids is not None and not any(m.msg_id in pending_ids for m in window.messages):
-            continue
-        if result.quota_exhausted:  # not sent; counts as failed so it is retried next import
+        window_ids = {m.msg_id for m in window.messages}
+
+        # After a quota error, don't send anything else. Mark the rest as failed so
+        # they are tried again next time.
+        if result.quota_exhausted:
             result.failed_windows.append(window.index)
-            result.failed_ids |= {m.msg_id for m in window.messages}
+            result.failed_ids |= window_ids
             continue
+
+        # Ask the LLM.
         result.windows_sent += 1
         try:
-            raw_json = client.generate_json(
+            reply = client.generate_json(
                 system=SYSTEM_PROMPT,
                 user=render_window(window, participants, tz),
                 schema=RawExtraction,
             )
-            raw = RawExtraction.model_validate_json(raw_json)
-        except (LLMError, ValidationError) as exc:
-            logger.warning("Window %d failed: %s", window.index, type(exc).__name__)
+            raw = RawExtraction.model_validate_json(reply)
+        except (LLMError, ValidationError) as error:
+            logger.warning("Window %d failed: %s", window.index, type(error).__name__)
             result.failed_windows.append(window.index)
-            result.failed_ids |= {m.msg_id for m in window.messages}
-            if isinstance(exc, QuotaExhausted):
+            result.failed_ids |= window_ids
+            if isinstance(error, QuotaExhausted):
                 logger.warning("Gemini quota used up; stopping. The rest is retried next import.")
                 result.quota_exhausted = True
             continue
 
-        ctx = WindowContext(
+        # Check every suggested record against the real messages.
+        context = WindowContext(
             messages_by_id={m.msg_id: m for m in window.all_messages},
-            new_ids={m.msg_id for m in window.messages},
+            new_ids=window_ids,
             participants=participants,
             tz=tz,
         )
-        batch = validate_extraction(raw, ctx)
-        result.processed_ids |= ctx.new_ids
+        batch = validate_extraction(raw, context)
         result.expenses += batch.expenses
         result.settlements += batch.settlements
         result.commitments += batch.commitments
         result.events += batch.events
         result.rejected += batch.rejected
-        result.skipped_overlap += batch.skipped_overlap
 
     logger.info(
-        "Extraction: %d windows (%d sent, %d failed), %d expenses, %d settlements, %d commitments, "
-        "%d events, %d rejected",
-        result.windows, result.windows_sent, len(result.failed_windows), len(result.expenses), len(result.settlements),
-        len(result.commitments), len(result.events), len(result.rejected),
+        "Extraction: %d windows (%d sent, %d failed), %d expenses, %d settlements, "
+        "%d commitments, %d events, %d rejected",
+        result.windows, result.windows_sent, len(result.failed_windows),
+        len(result.expenses), len(result.settlements), len(result.commitments),
+        len(result.events), len(result.rejected),
     )
     return result

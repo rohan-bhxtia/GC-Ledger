@@ -1,4 +1,4 @@
-"""Pick the LLM backend from settings (GCL_LLM_PROVIDER = gemini | ollama)."""
+"""Pick the LLM from the settings: GCL_LLM_PROVIDER=gemini (the default) or ollama."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from gcl.extractor import LLMClient
 
 def client_from_settings(settings: Settings | None = None) -> LLMClient:
     settings = settings or get_settings()
+
     if settings.llm_provider == "ollama":
         from gcl.ollama import OllamaClient
 
@@ -17,6 +18,8 @@ def client_from_settings(settings: Settings | None = None) -> LLMClient:
             timeout_seconds=settings.ollama_timeout_seconds,
             num_ctx=settings.ollama_num_ctx,
         )
+
+    # Imported here, so Google's library is only loaded when Gemini is used.
     from gcl.gemini import client_from_settings as gemini_client
 
     return gemini_client(settings)

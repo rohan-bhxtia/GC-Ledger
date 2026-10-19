@@ -1,27 +1,27 @@
-"""Balances from validated records. Pure Python, integer paise, no LLM.
+"""Work out who owes whom. Plain Python maths in whole paise, no LLM.
 
 Rules:
-- Only CONFIRMED expenses count. Proposed/cancelled are ignored; disputed or flagged
-  expenses are listed as "needs review" and never silently added.
-- Settlements count when CLAIMED or CONFIRMED (the explanation shows which).
-- Equal splits divide in paise; leftover paise go one each to participants in name order,
-  so totals always add up exactly.
-- Invariant: all net balances sum to zero (checked on every computation).
+  - Only CONFIRMED expenses count. Proposed and cancelled ones are ignored.
+  - Disputed or flagged expenses go on a "needs review" list. They are never added silently.
+  - Settlements ("paid you back") count whether the sender claimed them or the receiver confirmed.
+  - An equal split is done in paise. Leftover paise go one each to the first names
+    alphabetically, so the shares always add up to exactly the total.
+  - Safety check: everyone's balances must add up to zero. If they don't, we stop
+    rather than show wrong money.
+
+A positive balance means the person is owed money. A negative balance means they owe money.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from gcl.db import Database, Stored
 from gcl.models import Expense, ExpenseStatus, Message, Settlement, SettlementStatus, SplitType
 
-# Flags that make an expense unsafe to count without a human looking at it.
+# Flags that mean "a person should look at this before we count it", with a plain reason.
 BLOCKING_FLAGS = {
-    "possible_duplicate": "may be a duplicate of another expense",
     "participants_unspecified": "who shares the cost is not stated",
     "split_unspecified": "how to split it is not stated",
     "split_count_mismatch": "head count does not match the people named",
@@ -32,10 +32,11 @@ BLOCKING_FLAGS = {
 
 @dataclass(frozen=True)
 class Entry:
-    """One line of a person's balance: positive = they are owed, negative = they owe."""
+    """One line in a person's balance. Positive = they are owed; negative = they owe."""
+
     person: str
     delta_paise: int
-    kind: str              # "paid" | "share" | "sent" | "received"
+    kind: str                       # "paid", "share", "sent" or "received"
     record_id: int
     description: str
     source_msg_ids: tuple[str, ...]
@@ -44,6 +45,8 @@ class Entry:
 
 @dataclass(frozen=True)
 class Transfer:
+    """One payment that settles up: `debtor` pays `creditor`."""
+
     debtor: str
     creditor: str
     amount_paise: int
@@ -51,12 +54,14 @@ class Transfer:
 
 @dataclass(frozen=True)
 class Excluded:
+    """A record we did not count, and why."""
+
     record_id: int
-    kind: str              # "expense" | "settlement"
+    kind: str              # "expense" or "settlement"
     description: str
     amount_paise: int
     reason: str
-    needs_review: bool     # True = a human should decide; False = correctly ignored
+    needs_review: bool     # True = a person should decide; False = rightly ignored
 
 
 @dataclass
@@ -67,54 +72,69 @@ class Ledger:
     excluded: list[Excluded] = field(default_factory=list)
 
     def entries_for(self, person: str) -> list[Entry]:
-        return [e for e in self.entries if e.person == person]
+        return [entry for entry in self.entries if entry.person == person]
 
     @property
     def needs_review(self) -> list[Excluded]:
-        return [x for x in self.excluded if x.needs_review]
+        return [item for item in self.excluded if item.needs_review]
 
 
-# --- Formatting --------------------------------------------------------------------------
+# =============================================================================
+# Showing money
+# =============================================================================
 
 def rupees(paise: int) -> str:
+    """123456789 paise -> '₹12,34,567.89' (Indian digit grouping)."""
     sign = "-" if paise < 0 else ""
     whole, part = divmod(abs(paise), 100)
     return f"{sign}₹{_indian_grouping(whole)}.{part:02d}"
 
 
-def _indian_grouping(n: int) -> str:
-    s = str(n)
-    if len(s) <= 3:
-        return s
-    head, tail = s[:-3], s[-3:]
+def _indian_grouping(number: int) -> str:
+    """1234567 -> '12,34,567': the last 3 digits, then groups of 2."""
+    digits = str(number)
+    if len(digits) <= 3:
+        return digits
+
+    last_three = digits[-3:]
+    rest = digits[:-3]
     groups = []
-    while len(head) > 2:
-        groups.insert(0, head[-2:])
-        head = head[:-2]
-    if head:
-        groups.insert(0, head)
-    return ",".join(groups + [tail])
+    while len(rest) > 2:
+        groups.insert(0, rest[-2:])
+        rest = rest[:-2]
+    if rest:
+        groups.insert(0, rest)
+    return ",".join(groups + [last_three])
 
 
-# --- Core computation ------------------------------------------------------------------------
+# =============================================================================
+# The calculation
+# =============================================================================
 
 def split_equally(amount_paise: int, people: list[str]) -> dict[str, int]:
-    """Exact integer split; leftover paise go to the first names alphabetically."""
+    """Split exactly. ₹100.00 between 3 -> 3334, 3333, 3333 paise (first name gets the extra)."""
     ordered = sorted(people)
-    base, remainder = divmod(amount_paise, len(ordered))
-    return {p: base + (1 if i < remainder else 0) for i, p in enumerate(ordered)}
+    each, leftover = divmod(amount_paise, len(ordered))
+    shares = {}
+    for position, person in enumerate(ordered):
+        extra = 1 if position < leftover else 0
+        shares[person] = each + extra
+    return shares
 
 
-def _expense_exclusion(expense: Expense) -> tuple[str, bool] | None:
+def _why_not_counted(expense: Expense) -> tuple[str, bool] | None:
+    """If this expense shouldn't be counted, return (reason, needs_review). Else None."""
     if expense.status is ExpenseStatus.PROPOSED:
         return "not confirmed (only proposed)", False
     if expense.status is ExpenseStatus.CANCELLED:
         return "cancelled", False
     if expense.status is ExpenseStatus.DISPUTED:
         return "disputed in the chat", True
-    blocking = [BLOCKING_FLAGS[f] for f in expense.flags if f in BLOCKING_FLAGS]
-    if blocking:
-        return "; ".join(blocking), True
+
+    blocking_reasons = [BLOCKING_FLAGS[flag] for flag in expense.flags if flag in BLOCKING_FLAGS]
+    if blocking_reasons:
+        return "; ".join(blocking_reasons), True
+
     if not expense.participants:
         return "who shares the cost is not stated", True
     return None
@@ -122,108 +142,155 @@ def _expense_exclusion(expense: Expense) -> tuple[str, bool] | None:
 
 def compute_ledger(expenses: list[Stored[Expense]], settlements: list[Stored[Settlement]]) -> Ledger:
     ledger = Ledger()
-    net: dict[str, int] = defaultdict(int)
+    balance: dict[str, int] = {}
 
+    def add(person: str, paise: int) -> None:
+        balance[person] = balance.get(person, 0) + paise
+
+    # --- Expenses: the payer is owed the total; each participant owes their share.
     for stored in expenses:
-        e = stored.record
-        exclusion = _expense_exclusion(e)
-        if exclusion:
-            reason, review = exclusion
-            ledger.excluded.append(Excluded(stored.id, "expense", e.description, e.amount_paise, reason, review))
+        expense = stored.record
+
+        problem = _why_not_counted(expense)
+        if problem:
+            reason, needs_review = problem
+            ledger.excluded.append(Excluded(
+                stored.id, "expense", expense.description, expense.amount_paise, reason, needs_review,
+            ))
             continue
 
-        if e.split is SplitType.EXACT:
-            shares, how = e.shares_paise, "exact share"
+        if expense.split is SplitType.EXACT:
+            shares = expense.shares_paise
+            how = "exact share"
         else:
-            shares = split_equally(e.amount_paise, e.participants)
-            how = f"{rupees(e.amount_paise)} ÷ {len(shares)}"
-        note = "participants inferred from head count" if "participants_inferred" in e.flags else ""
-        sources = tuple(e.source_msg_ids)
+            shares = split_equally(expense.amount_paise, expense.participants)
+            how = f"{rupees(expense.amount_paise)} ÷ {len(shares)}"
 
-        net[e.payer] += e.amount_paise
-        ledger.entries.append(Entry(e.payer, e.amount_paise, "paid", stored.id, e.description, sources, note))
+        note = ""
+        if "participants_inferred" in expense.flags:
+            note = "participants inferred from head count"
+        sources = tuple(expense.source_msg_ids)
+
+        add(expense.payer, expense.amount_paise)
+        ledger.entries.append(Entry(
+            expense.payer, expense.amount_paise, "paid", stored.id, expense.description, sources, note,
+        ))
         for person, share in shares.items():
-            net[person] -= share
-            ledger.entries.append(Entry(person, -share, "share", stored.id, e.description, sources, how))
+            add(person, -share)
+            ledger.entries.append(Entry(
+                person, -share, "share", stored.id, expense.description, sources, how,
+            ))
 
+    # --- Settlements: paying someone back moves money the other way.
     for stored in settlements:
-        s = stored.record
-        if s.flags and any(f in BLOCKING_FLAGS for f in s.flags):
-            reason = "; ".join(BLOCKING_FLAGS[f] for f in s.flags if f in BLOCKING_FLAGS)
-            ledger.excluded.append(Excluded(stored.id, "settlement",
-                                            f"{s.from_person} → {s.to_person}", s.amount_paise, reason, True))
-            continue
-        label = "claimed by sender" if s.status is SettlementStatus.CLAIMED else "confirmed"
-        sources = tuple(s.source_msg_ids)
-        net[s.from_person] += s.amount_paise
-        net[s.to_person] -= s.amount_paise
-        ledger.entries.append(Entry(s.from_person, s.amount_paise, "sent", stored.id,
-                                    f"payment to {s.to_person}", sources, label))
-        ledger.entries.append(Entry(s.to_person, -s.amount_paise, "received", stored.id,
-                                    f"payment from {s.from_person}", sources, label))
+        settlement = stored.record
 
-    if sum(net.values()) != 0:  # can only happen through a bug; never show wrong money
+        blocking_reasons = [BLOCKING_FLAGS[f] for f in settlement.flags if f in BLOCKING_FLAGS]
+        if blocking_reasons:
+            ledger.excluded.append(Excluded(
+                stored.id, "settlement",
+                f"{settlement.from_person} → {settlement.to_person}",
+                settlement.amount_paise, "; ".join(blocking_reasons), True,
+            ))
+            continue
+
+        if settlement.status is SettlementStatus.CLAIMED:
+            label = "claimed by sender"
+        else:
+            label = "confirmed"
+        sources = tuple(settlement.source_msg_ids)
+
+        add(settlement.from_person, settlement.amount_paise)
+        add(settlement.to_person, -settlement.amount_paise)
+        ledger.entries.append(Entry(
+            settlement.from_person, settlement.amount_paise, "sent", stored.id,
+            f"payment to {settlement.to_person}", sources, label,
+        ))
+        ledger.entries.append(Entry(
+            settlement.to_person, -settlement.amount_paise, "received", stored.id,
+            f"payment from {settlement.from_person}", sources, label,
+        ))
+
+    # --- Safety check: money can't appear or disappear.
+    if sum(balance.values()) != 0:
         raise AssertionError("ledger does not balance")
 
-    ledger.balances = dict(sorted(net.items()))
+    ledger.balances = dict(sorted(balance.items()))
     ledger.transfers = settle_up(ledger.balances)
     return ledger
 
 
 def settle_up(balances: dict[str, int]) -> list[Transfer]:
-    """Few transfers that clear every balance: largest debtor pays largest creditor, repeat."""
-    debtors = sorted(((-v, p) for p, v in balances.items() if v < 0), key=lambda x: (-x[0], x[1]))
-    creditors = sorted(((v, p) for p, v in balances.items() if v > 0), key=lambda x: (-x[0], x[1]))
-    debtors = [list(d) for d in debtors]
-    creditors = [list(c) for c in creditors]
+    """Find a few payments that bring everyone to zero.
+
+    Repeatedly: the person who owes the most pays the person who is owed the most.
+    """
+    # [amount, name] lists, biggest amount first (ties: alphabetical).
+    owes = sorted([[-amount, person] for person, amount in balances.items() if amount < 0],
+                  key=lambda item: (-item[0], item[1]))
+    owed = sorted([[amount, person] for person, amount in balances.items() if amount > 0],
+                  key=lambda item: (-item[0], item[1]))
+
     transfers: list[Transfer] = []
-    i = j = 0
-    while i < len(debtors) and j < len(creditors):
-        amount = min(debtors[i][0], creditors[j][0])
-        transfers.append(Transfer(debtors[i][1], creditors[j][1], amount))
-        debtors[i][0] -= amount
-        creditors[j][0] -= amount
-        if debtors[i][0] == 0:
+    i = 0
+    j = 0
+    while i < len(owes) and j < len(owed):
+        amount = min(owes[i][0], owed[j][0])
+        transfers.append(Transfer(debtor=owes[i][1], creditor=owed[j][1], amount_paise=amount))
+        owes[i][0] -= amount
+        owed[j][0] -= amount
+        if owes[i][0] == 0:
             i += 1
-        if creditors[j][0] == 0:
+        if owed[j][0] == 0:
             j += 1
     return transfers
 
 
-# --- Explanations -----------------------------------------------------------------------------
+# =============================================================================
+# Explaining one person's balance
+# =============================================================================
 
 def explain(ledger: Ledger, person: str, messages: dict[str, Message], tz: ZoneInfo) -> str:
-    """Step-by-step: every line that makes up `person`'s balance, with the source messages."""
+    """Every line that makes up a person's balance, with the messages it came from."""
     balance = ledger.balances.get(person, 0)
-    status = "is owed" if balance > 0 else "owes" if balance < 0 else "is settled"
-    lines = [f"{person} {status} {rupees(abs(balance))}" if balance else f"{person} is settled"]
+    if balance > 0:
+        lines = [f"{person} is owed {rupees(balance)}"]
+    elif balance < 0:
+        lines = [f"{person} owes {rupees(-balance)}"]
+    else:
+        lines = [f"{person} is settled"]
 
     for entry in ledger.entries_for(person):
         sign = "+" if entry.delta_paise > 0 else "−"
-        what = {
-            "paid": f'paid for "{entry.description}"',
-            "share": f'share of "{entry.description}" ({entry.note})',
-            "sent": f"{entry.description} ({entry.note})",
-            "received": f"{entry.description} ({entry.note})",
-        }[entry.kind]
-        if entry.kind == "paid" and entry.note:
-            what += f" [{entry.note}]"
+
+        if entry.kind == "paid":
+            what = f'paid for "{entry.description}"'
+            if entry.note:
+                what += f" [{entry.note}]"
+        elif entry.kind == "share":
+            what = f'share of "{entry.description}" ({entry.note})'
+        else:  # "sent" or "received"
+            what = f"{entry.description} ({entry.note})"
+
         lines.append(f"  {sign} {rupees(abs(entry.delta_paise)):>14}  {what}")
+
         for msg_id in entry.source_msg_ids:
-            m = messages.get(msg_id)
-            if m:
-                when = m.timestamp.astimezone(tz).strftime("%d %b %H:%M")
-                lines.append(f"      ↳ {when} {m.sender}: \"{_short(m.text)}\" [{msg_id[:8]}]")
+            message = messages.get(msg_id)
+            if message:
+                when = message.timestamp.astimezone(tz).strftime("%d %b %H:%M")
+                lines.append(f'      ↳ {when} {message.sender}: "{_shorten(message.text)}" [{msg_id[:8]}]')
+
     lines.append(f"  = {rupees(balance):>15}")
     return "\n".join(lines)
 
 
-def _short(text: str, limit: int = 70) -> str:
+def _shorten(text: str, limit: int = 70) -> str:
     text = " ".join(text.split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
-
-# --- Convenience ------------------------------------------------------------------------------
 
 def ledger_for_chat(db: Database, chat_id: int) -> Ledger:
+    """The ledger for a stored chat."""
     return compute_ledger(db.records(chat_id, "expense"), db.records(chat_id, "settlement"))
