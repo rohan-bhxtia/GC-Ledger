@@ -12,7 +12,6 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "google-genai>=2.0",
-    "httpx>=0.27",
     "tzdata; sys_platform == 'win32'",
 ]
 
@@ -30,5 +29,4 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = ["live: calls the real Gemini API (run with: pytest -m live)"]
 addopts = "-m 'not live'"
-# google-genai on Python 3.14; matched by message text so other warnings still show.
-filterwarnings = ["ignore:'_UnionGenericAlias' is deprecated:DeprecationWarning"]
+filterwarnings = ["ignore::DeprecationWarning:google.genai.*"]
